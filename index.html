@@ -1,8 +1,8 @@
 <!DOCTYPE html>
-<html lang="fr">
+<html lang="en">
 <head>
 <meta charset="utf-8">
-<title>UMAP ↔ Lame — explorateur de noyaux</title>
+<title>UMAP ↔ Slide — nucleus explorer</title>
 <script src="https://unpkg.com/deck.gl@9.0.0/dist.min.js"></script>
 <style>
   html,body{margin:0;height:100%;font-family:system-ui,sans-serif;background:#111;color:#eee}
@@ -24,25 +24,25 @@
 </head>
 <body>
 <div id="bar">
-  <label>Méthode</label>
+  <label>Method</label>
   <select id="method"><option value="cellvit">CellViT (1280-d)</option><option value="lspdetr">LSP-DETR (384-d)</option></select>
-  <label>Colorer par</label>
+  <label>Color by</label>
   <select id="attr"></select>
   <button id="lasso">✋ Lasso</button>
-  <button id="clear">Effacer sélection</button>
+  <button id="clear">Clear selection</button>
   <span id="count"></span>
 </div>
 <div id="views">
   <div class="pane" id="slidePane">
-    <div class="title">Lame TCGA-EM-A4FQ</div>
+    <div class="title">Slide TCGA-EM-A4FQ</div>
     <div id="legend"></div>
-    <div class="hint">Lasso ON = dessine ; OFF = pan/zoom</div>
+    <div class="hint">Lasso ON = draw (adds to selection) · OFF = pan/zoom</div>
     <canvas id="slideCanvas"></canvas>
     <div class="overlay" id="slideOverlay"></div>
   </div>
   <div class="pane" id="umapPane">
-    <div class="title">UMAP des embeddings</div>
-    <div class="hint">sélection synchronisée ↔ lame</div>
+    <div class="title">Embedding UMAP</div>
+    <div class="hint">selection linked ↔ slide</div>
     <canvas id="umapCanvas"></canvas>
     <div class="overlay" id="umapOverlay"></div>
   </div>
@@ -83,9 +83,9 @@ async function loadMethod(method){
   umapData ={length:N, attributes:{getPosition:{value:UMAP,size:2}}};
   selected=new Uint8Array(N); selCount=0; selVer++;
   // menu attribut
-  const sel=document.getElementById('attr'); sel.innerHTML='<option value="__none__">(aucune)</option>';
+  const sel=document.getElementById('attr'); sel.innerHTML='<option value="__none__">(none)</option>';
   for(const name of Object.keys(META.attributes)){ const o=document.createElement('option'); o.value=name; o.textContent=name; sel.appendChild(o); }
-  curAttr='__none__'; sel.value=curAttr;          // démarrage SANS coloration
+  curAttr='__none__'; sel.value=curAttr;          // start with NO coloring
   buildLegend();
   recolor();
   render(true);
@@ -166,13 +166,12 @@ function finishLasso(){
   if(!drawing || drawing.world.length<3){ drawing=null; render(); return; }
   const poly=drawing.world, src=drawing.pane;
   const data = src==='slide'?POS:UMAP;
-  selected=new Uint8Array(N); selCount=0;
-  // bbox pour accélérer
+  // additive multi-selection: keep current selection, add nuclei inside this lasso
   let minx=1e18,miny=1e18,maxx=-1e18,maxy=-1e18;
   for(const p of poly){ minx=Math.min(minx,p[0]);maxx=Math.max(maxx,p[0]);miny=Math.min(miny,p[1]);maxy=Math.max(maxy,p[1]); }
   for(let i=0;i<N;i++){ const x=data[i*2],y=data[i*2+1];
     if(x<minx||x>maxx||y<miny||y>maxy) continue;
-    if(pointInPoly(x,y,poly)){ selected[i]=1; selCount++; } }
+    if(!selected[i] && pointInPoly(x,y,poly)){ selected[i]=1; selCount++; } }
   drawing=null; recolor(); render(); updateCount();
 }
 function attachLasso(pane, canvasId){
@@ -208,7 +207,7 @@ function renderLasso(){       // maj légère pendant le tracé (couleurs en cac
   if(umapDeck) umapDeck.setProps({layers:umapLayers()});
 }
 function updateCount(){ document.getElementById('count').textContent =
-  selCount>0 ? `${selCount.toLocaleString()} / ${N.toLocaleString()} noyaux sélectionnés` : `${N.toLocaleString()} noyaux`; }
+  selCount>0 ? `${selCount.toLocaleString()} / ${N.toLocaleString()} nuclei selected` : `${N.toLocaleString()} nuclei`; }
 
 // ---------- UI ----------
 document.getElementById('method').onchange=e=>loadMethod(e.target.value);
