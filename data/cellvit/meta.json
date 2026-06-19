@@ -1,0 +1,53 @@
+{
+  "n": 400753,
+  "slide": {
+    "width": 46711,
+    "height": 39030
+  },
+  "umap": {
+    "xmin": -1.6483460664749146,
+    "xmax": 13.689855575561523,
+    "ymin": -1.4925862550735474,
+    "ymax": 11.692129135131836
+  },
+  "attributes": {
+    "kmeans": {
+      "type": "categorical",
+      "categories": [
+        "0",
+        "1",
+        "2",
+        "3"
+      ]
+    },
+    "leiden": {
+      "type": "categorical",
+      "categories": [
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10",
+        "11",
+        "12",
+        "13"
+      ]
+    },
+    "pannuke_type": {
+      "type": "categorical",
+      "categories": [
+        "Connective",
+        "Dead",
+        "Epithelial",
+        "Inflammatory",
+        "Neoplastic"
+      ]
+    }
+  }
+}

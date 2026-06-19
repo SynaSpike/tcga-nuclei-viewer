@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>UMAP ↔ Lame — explorateur de noyaux</title>
+<script src="https://unpkg.com/deck.gl@9.0.0/dist.min.js"></script>
+<style>
+  html,body{margin:0;height:100%;font-family:system-ui,sans-serif;background:#111;color:#eee}
+  #bar{height:46px;display:flex;align-items:center;gap:14px;padding:0 14px;background:#1d1f26;border-bottom:1px solid #333}
+  #bar label{font-size:13px;color:#aaa}
+  select,button{background:#2a2d36;color:#eee;border:1px solid #444;border-radius:5px;padding:4px 8px;font-size:13px}
+  button.on{background:#2d6cdf;border-color:#2d6cdf}
+  #views{display:flex;height:calc(100% - 46px)}
+  .pane{position:relative;flex:1;border-right:1px solid #333}
+  .pane canvas{position:absolute;inset:0}
+  .title{position:absolute;top:8px;left:10px;z-index:5;background:rgba(0,0,0,.45);padding:3px 8px;border-radius:5px;font-size:13px}
+  #legend{position:absolute;bottom:8px;left:10px;z-index:5;background:rgba(0,0,0,.55);padding:6px 9px;border-radius:6px;font-size:12px;max-width:230px}
+  #legend .row{display:flex;align-items:center;gap:6px;margin:2px 0}
+  #legend .sw{width:12px;height:12px;border-radius:2px;display:inline-block}
+  #count{margin-left:auto;font-size:13px;color:#9fd}
+  .hint{position:absolute;bottom:8px;right:10px;z-index:5;font-size:11px;color:#888;background:rgba(0,0,0,.4);padding:3px 7px;border-radius:5px}
+  .overlay{position:absolute;inset:0;z-index:4;pointer-events:none;cursor:crosshair}
+</style>
+</head>
+<body>
+<div id="bar">
+  <label>Méthode</label>
+  <select id="method"><option value="cellvit">CellViT (1280-d)</option><option value="lspdetr">LSP-DETR (384-d)</option></select>
+  <label>Colorer par</label>
+  <select id="attr"></select>
+  <button id="lasso">✋ Lasso</button>
+  <button id="clear">Effacer sélection</button>
+  <span id="count"></span>
+</div>
+<div id="views">
+  <div class="pane" id="slidePane">
+    <div class="title">Lame TCGA-EM-A4FQ</div>
+    <div id="legend"></div>
+    <div class="hint">Lasso ON = dessine ; OFF = pan/zoom</div>
+    <canvas id="slideCanvas"></canvas>
+    <div class="overlay" id="slideOverlay"></div>
+  </div>
+  <div class="pane" id="umapPane">
+    <div class="title">UMAP des embeddings</div>
+    <div class="hint">sélection synchronisée ↔ lame</div>
+    <canvas id="umapCanvas"></canvas>
+    <div class="overlay" id="umapOverlay"></div>
+  </div>
+</div>
+
+<script>
+const {Deck, OrthographicView, ScatterplotLayer, BitmapLayer, PolygonLayer} = deck;
+
+// palette catégorielle (20 couleurs) + override biologique pour PanNuke
+const PALETTE = [[228,26,28],[55,126,184],[77,175,74],[152,78,163],[255,127,0],
+  [255,217,47],[166,86,40],[247,129,191],[153,153,153],[26,188,156],
+  [31,119,180],[255,152,150],[44,160,44],[214,39,40],[148,103,189],
+  [140,86,75],[227,119,194],[127,127,127],[188,189,34],[23,190,207]];
+const TYPE_COLORS = {Neoplastic:[228,26,28],Connective:[55,126,184],Epithelial:[77,175,74],
+  Inflammatory:[152,78,163],Dead:[153,153,153]};
+
+let META, N, POS, UMAP, ATTRS={}, curAttr, selected, selCount=0, selVer=0, COLORS;
+let slideData, umapData;       // objets data STABLES (réutilisés à chaque rendu)
+let TILES=null;                // tuiles de la lame (sinon repli sur slide.jpg)
+let slideDeck, umapDeck, lassoOn=false;
+let vsSlide, vsUMAP;          // (non utilisés : unproject via getViewports)
+const W=()=>META.slide.width, H=()=>META.slide.height;
+
+async function bin(url, Type){ const b=await (await fetch(url)).arrayBuffer(); return new Type(b); }
+
+async function loadMethod(method){
+  META = await (await fetch(`data/${method}/meta.json`)).json();
+  N = META.n;
+  const pos = await bin(`data/${method}/positions.bin`, Float32Array);  // x,y (px niveau-0)
+  POS = new Float32Array(N*2);                 // y inversé pour un affichage à l'endroit
+  for(let i=0;i<N;i++){ POS[i*2]=pos[i*2]; POS[i*2+1]=H()-pos[i*2+1]; }
+  UMAP = await bin(`data/${method}/umap.bin`, Float32Array);
+  ATTRS={};
+  for(const name of Object.keys(META.attributes)) ATTRS[name]=await bin(`data/${method}/${name}.bin`, Int16Array);
+  // buffers + objets data créés UNE fois (références stables -> pas de ré-upload GPU)
+  COLORS=new Uint8Array(N*4);   // couleurs lues par l'accesseur getFillColor
+  slideData={length:N, attributes:{getPosition:{value:POS,size:2}}};   // positions binaires stables
+  umapData ={length:N, attributes:{getPosition:{value:UMAP,size:2}}};
+  selected=new Uint8Array(N); selCount=0; selVer++;
+  // menu attribut
+  const sel=document.getElementById('attr'); sel.innerHTML='<option value="__none__">(aucune)</option>';
+  for(const name of Object.keys(META.attributes)){ const o=document.createElement('option'); o.value=name; o.textContent=name; sel.appendChild(o); }
+  curAttr='__none__'; sel.value=curAttr;          // démarrage SANS coloration
+  buildLegend();
+  recolor();
+  render(true);
+  updateCount();
+}
+
+function catColor(name, code){
+  const a=META.attributes[name];
+  if(name==='pannuke_type'){ const c=TYPE_COLORS[a.categories[code]]; if(c) return c; }
+  return PALETTE[code % PALETTE.length];
+}
+
+function recolor(){           // remplit COLORS ; getFillColor (accesseur) le relit au bump de selVer
+  const none = curAttr==='__none__';
+  const codes = none?null:ATTRS[curAttr];
+  const anySel=selCount>0;
+  for(let i=0;i<N;i++){
+    let c, al;
+    if(anySel && !selected[i]){ c=[120,120,120]; al=20; }       // non sélectionné -> estompé
+    else if(none){ c = anySel ? [255,70,70] : [90,90,115]; al=235; }  // sélection en rouge vif sur le tissu
+    else { c=catColor(curAttr, codes[i]); al = anySel?245:205; }
+    COLORS[i*4]=c[0]; COLORS[i*4+1]=c[1]; COLORS[i*4+2]=c[2]; COLORS[i*4+3]=al;
+  }
+  selVer++;
+}
+
+function buildLegend(){
+  const el=document.getElementById('legend');
+  if(curAttr==='__none__'){ el.innerHTML=''; return; }
+  const a=META.attributes[curAttr];
+  let h=`<b>${curAttr}</b>`;
+  a.categories.forEach((cat,code)=>{ const c=catColor(curAttr,code);
+    h+=`<div class="row"><span class="sw" style="background:rgb(${c[0]},${c[1]},${c[2]})"></span>${cat}</div>`; });
+  el.innerHTML=h;
+}
+
+function scatter(id, data, opacity){   // opacity = transparence de la COUCHE (laisse voir le tissu)
+  return new ScatterplotLayer({
+    id, data, opacity,
+    getFillColor:(o,{index})=>[COLORS[index*4],COLORS[index*4+1],COLORS[index*4+2],COLORS[index*4+3]],
+    radiusUnits:'pixels', getRadius:2, radiusMinPixels:1, radiusMaxPixels:8,
+    pickable:false, updateTriggers:{getFillColor:selVer}
+  });
+}
+
+function slideLayers(){       // points INVISIBLES sur la lame tant qu'il n'y a ni coloration ni sélection
+  const op = (curAttr==='__none__' && selCount===0) ? 0 : 0.85;
+  // image de la lame : tuiles (haute-rés, pas de limite de texture) ou repli slide.jpg
+  const imgs = TILES
+    ? TILES.map(t=>new BitmapLayer({id:'wsi-'+t.file, image:'tiles/'+t.file, bounds:t.bounds}))
+    : [ new BitmapLayer({id:'wsi', image:'slide.jpg', bounds:[0,0,W(),H()]}) ];
+  return [ ...imgs, scatter('pts-slide', slideData, op), lassoLayer('slide') ];
+}
+function umapLayers(){ return [ scatter('pts-umap', umapData, 0.9), lassoLayer('umap') ]; }
+
+// ---------- LASSO ----------
+let drawing=null;  // {pane, screenPath:[[x,y]...]}
+function lassoLayer(pane){
+  if(!drawing || drawing.pane!==pane || drawing.world.length<2) return null;
+  return new PolygonLayer({id:'lasso-'+pane, data:[drawing.world],
+    getPolygon:d=>d, stroked:true, filled:true, getFillColor:[45,108,223,40],
+    getLineColor:[45,108,223,220], getLineWidth:1.5, lineWidthUnits:'pixels'});
+}
+function viewportFor(pane){   // viewport RÉEL de deck.gl (évite tout désalignement flipY)
+  const d = pane==='slide'?slideDeck:umapDeck;
+  const vps = d.getViewports();
+  return vps && vps.length ? vps[0] : null;
+}
+function pointInPoly(x,y,poly){
+  let inside=false;
+  for(let i=0,j=poly.length-1;i<poly.length;j=i++){
+    const xi=poly[i][0],yi=poly[i][1],xj=poly[j][0],yj=poly[j][1];
+    if(((yi>y)!==(yj>y)) && (x<(xj-xi)*(y-yi)/(yj-yi)+xi)) inside=!inside;
+  }
+  return inside;
+}
+function finishLasso(){
+  if(!drawing || drawing.world.length<3){ drawing=null; render(); return; }
+  const poly=drawing.world, src=drawing.pane;
+  const data = src==='slide'?POS:UMAP;
+  selected=new Uint8Array(N); selCount=0;
+  // bbox pour accélérer
+  let minx=1e18,miny=1e18,maxx=-1e18,maxy=-1e18;
+  for(const p of poly){ minx=Math.min(minx,p[0]);maxx=Math.max(maxx,p[0]);miny=Math.min(miny,p[1]);maxy=Math.max(maxy,p[1]); }
+  for(let i=0;i<N;i++){ const x=data[i*2],y=data[i*2+1];
+    if(x<minx||x>maxx||y<miny||y>maxy) continue;
+    if(pointInPoly(x,y,poly)){ selected[i]=1; selCount++; } }
+  drawing=null; recolor(); render(); updateCount();
+}
+function attachLasso(pane, canvasId){
+  const c=document.getElementById(canvasId);
+  c.addEventListener('pointerdown', e=>{ if(!lassoOn) return;
+    drawing={pane, screen:[[e.offsetX,e.offsetY]], world:[]}; });
+  c.addEventListener('pointermove', e=>{ if(!lassoOn||!drawing||drawing.pane!==pane) return;
+    const vp=viewportFor(pane); if(!vp) return;
+    drawing.screen.push([e.offsetX,e.offsetY]);
+    drawing.world=drawing.screen.map(p=>{ const w=vp.unproject(p); return [w[0],w[1]]; });
+    renderLasso(); });
+  window.addEventListener('pointerup', ()=>{ if(lassoOn&&drawing) finishLasso(); });
+}
+
+function render(initial){
+  const common={controller:!lassoOn, views:new OrthographicView({flipY:false})};
+  if(initial || !slideDeck){
+    // vue NON contrôlée (deck.gl gère le viewState en interne -> pas de retard des points)
+    slideDeck=new Deck({canvas:'slideCanvas', ...common,
+      initialViewState:{target:[W()/2,H()/2,0], zoom:-6},
+      layers:slideLayers()});
+    const ur=(META.umap.xmin+META.umap.xmax)/2, vr=(META.umap.ymin+META.umap.ymax)/2;
+    umapDeck=new Deck({canvas:'umapCanvas', ...common,
+      initialViewState:{target:[ur,vr,0], zoom:5},
+      layers:umapLayers()});
+  } else {
+    slideDeck.setProps({controller:!lassoOn, layers:slideLayers()});
+    umapDeck.setProps({controller:!lassoOn, layers:umapLayers()});
+  }
+}
+function renderLasso(){       // maj légère pendant le tracé (couleurs en cache, juste le polygone)
+  if(slideDeck) slideDeck.setProps({layers:slideLayers()});
+  if(umapDeck) umapDeck.setProps({layers:umapLayers()});
+}
+function updateCount(){ document.getElementById('count').textContent =
+  selCount>0 ? `${selCount.toLocaleString()} / ${N.toLocaleString()} noyaux sélectionnés` : `${N.toLocaleString()} noyaux`; }
+
+// ---------- UI ----------
+document.getElementById('method').onchange=e=>loadMethod(e.target.value);
+document.getElementById('attr').onchange=e=>{ curAttr=e.target.value; buildLegend(); recolor(); render(); };
+function setLasso(on){ lassoOn=on;
+  document.getElementById('lasso').classList.toggle('on',on);
+  const pe = on?'auto':'none';
+  document.getElementById('slideOverlay').style.pointerEvents=pe;
+  document.getElementById('umapOverlay').style.pointerEvents=pe;
+  render(); }
+document.getElementById('lasso').onclick=()=>setLasso(!lassoOn);
+document.getElementById('clear').onclick=()=>{ selected=new Uint8Array(N); selCount=0; recolor(); render(); updateCount(); };
+
+attachLasso('slide','slideOverlay'); attachLasso('umap','umapOverlay');
+(async ()=>{
+  try{ const r=await fetch('tiles/tiles.json'); TILES = r.ok ? (await r.json()).tiles : null; }
+  catch(e){ TILES=null; }
+  await loadMethod('cellvit');
+})();
+</script>
+</body>
+</html>
