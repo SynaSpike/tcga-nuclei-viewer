@@ -42,6 +42,7 @@
   <button id="clear">Clear selection</button>
   <span class="sep"></span>
   <button id="roi" class="roi" style="display:none" title="Rectangle selection (Shift = square) → export high-res H&E crop with green nuclear contours">▭ ROI</button>
+  <input id="roiSize" type="number" min="0" step="64" placeholder="fixed px" title="Fixed ROI size in px (empty = free). e.g. 1024 for reproducible crops" style="width:76px;display:none">
   <button id="dlSlide" title="Download the current slide view (PNG)">⬇ Slide</button>
   <button id="dlUmap" title="Download the current UMAP view (PNG)">⬇ UMAP</button>
   <span id="count"></span>
@@ -244,7 +245,8 @@ function attachLasso(pane, canvasId){
 
 // ---------- ROI (rectangle -> export H&E crop + green contours) — needs the local backend ----------
 let roiDrawing=null, roiRect=null;
-const ROI_HINT='Drag on the slide = <b>rectangle</b> · <b>Shift = square</b> · release → export H&E crop with green contours';
+const ROI_HINT='Drag = <b>rectangle</b> · <b>Shift = square</b> · <b>fixed px</b> field = reproducible size · release → export (<b>selected</b> nuclei in green)';
+const roiFixedSize=()=>{ const v=parseInt(document.getElementById('roiSize').value,10); return (v&&v>0)?v:0; };
 function roiLayer(){
   if(!roiRect) return null;
   return new PolygonLayer({id:'roi-rect', data:[roiRect], getPolygon:d=>d,
@@ -252,19 +254,29 @@ function roiLayer(){
     getLineWidth:2, lineWidthUnits:'pixels'});
 }
 function clearRoiRect(){ roiRect=null; if(slideDeck) slideDeck.setProps({layers:slideLayers()}); }
+function updateRoiRect(px,py){   // px,py = pointer WORLD position
+  const S=roiFixedSize();
+  let x0,y0,x1,y1;
+  if(S>0){ const hf=S/2; x0=px-hf; y0=py-hf; x1=px+hf; y1=py+hf; }   // fixed SxS square centered on the pointer
+  else {
+    x0=roiDrawing.start[0]; y0=roiDrawing.start[1]; x1=px; y1=py;
+    if(shiftDown){ const dx=x1-x0, dy=y1-y0, s=Math.max(Math.abs(dx),Math.abs(dy));  // Shift -> square
+      x1=x0+(dx<0?-s:s); y1=y0+(dy<0?-s:s); }
+  }
+  roiRect=[[x0,y0],[x1,y0],[x1,y1],[x0,y1]];
+  const el=document.getElementById('roiInfo'); el.style.display='block';
+  el.innerHTML=`ROI ${Math.round(Math.abs(x1-x0))} × ${Math.round(Math.abs(y1-y0))} px${S>0?' · fixed size':''}`;
+}
 function attachRoi(){
   const c=document.getElementById('slideCanvas');
   c.addEventListener('pointerdown', e=>{ if(!roiMode()) return;
     const vp=viewportFor('slide'); if(!vp) return;
-    const w=vp.unproject([e.offsetX,e.offsetY]); roiDrawing={start:[w[0],w[1]]};
+    const w=vp.unproject([e.offsetX,e.offsetY]); roiDrawing={start:[w[0],w[1]]}; updateRoiRect(w[0],w[1]);
+    if(slideDeck) slideDeck.setProps({layers:slideLayers()});
     try{ c.setPointerCapture(e.pointerId); }catch(_){} });
   c.addEventListener('pointermove', e=>{ if(!roiDrawing) return;
     const vp=viewportFor('slide'); if(!vp) return;
-    const w=vp.unproject([e.offsetX,e.offsetY]);
-    let [sx,sy]=roiDrawing.start, ex=w[0], ey=w[1];
-    if(shiftDown){ const dx=ex-sx, dy=ey-sy, s=Math.max(Math.abs(dx),Math.abs(dy));  // Shift -> square
-      ex=sx+(dx<0?-s:s); ey=sy+(dy<0?-s:s); }
-    roiRect=[[sx,sy],[ex,sy],[ex,ey],[sx,ey]];
+    const w=vp.unproject([e.offsetX,e.offsetY]); updateRoiRect(w[0],w[1]);
     if(slideDeck) slideDeck.setProps({layers:slideLayers()}); });
   window.addEventListener('pointerup', ()=>{ if(roiDrawing){ roiDrawing=null; finishRoi(); } });
 }
@@ -272,22 +284,26 @@ function finishRoi(){
   if(!roiRect) return;
   const xs=roiRect.map(p=>p[0]), ys=roiRect.map(p=>p[1]);
   const minx=Math.min(...xs), maxx=Math.max(...xs), miny=Math.min(...ys), maxy=Math.max(...ys);
-  const x=Math.round(minx), w=Math.round(maxx-minx);
-  const y=Math.round(H()-maxy), h=Math.round(maxy-miny);   // world (y up) -> level-0 openslide (y down)
+  let w=Math.round(maxx-minx), h=Math.round(maxy-miny);
+  let x=Math.round(minx), y=Math.round(H()-maxy);          // world (y up) -> level-0 openslide (y down)
   if(w<8||h<8){ clearRoiRect(); return; }
+  x=Math.max(0,Math.min(x,W()-w)); y=Math.max(0,Math.min(y,H()-h));   // keep the exact size near edges
   exportRoi(x,y,w,h);
   clearRoiRect();      // the rectangle disappears once the ROI is captured
 }
 async function exportRoi(x,y,w,h){
   const el=document.getElementById('roiInfo'); el.style.display='block';
-  el.innerHTML=`Exporting ROI ${w}×${h} px… (high-res read + contour drawing)`;
+  const onlySel=selCount>0;
+  el.innerHTML=`Exporting ROI ${w}×${h} px… (${onlySel?'selected nuclei':'all nuclei'})`;
   try{
-    const r=await fetch(`roi?x=${x}&y=${y}&w=${w}&h=${h}`);
+    const opts={method:'POST'};
+    if(onlySel) opts.body=selected;            // selection mask -> draw ONLY those nuclei
+    const r=await fetch(`roi?x=${x}&y=${y}&w=${w}&h=${h}`, opts);
     if(!r.ok){ el.innerHTML='⚠ ROI export unavailable — start the <b>backend</b>: <b>python tool/server.py --slide tool/slide/TCGA-EM-A4FQ.svs</b>'; return; }
     const cells=r.headers.get('X-Roi-Cells')||'?';
     const blob=await r.blob(); const a=document.createElement('a');
     a.href=URL.createObjectURL(blob); a.download=`roi_x${x}_y${y}_w${w}_h${h}.png`; a.click();
-    el.innerHTML=`✓ ROI ${w}×${h} px · ${cells} nuclei · downloaded + saved to <b>tool/roi_exports/</b>`;
+    el.innerHTML=`✓ ROI ${w}×${h} px · ${cells}${onlySel?' selected':''} nuclei · downloaded + saved to <b>tool/roi_exports/</b>`;
     setTimeout(()=>{ if(roiMode()) el.innerHTML=ROI_HINT; }, 4500);
   }catch(err){ el.innerHTML='⚠ Backend required for ROI export (server.py, not the static server).'; }
 }
@@ -363,7 +379,7 @@ attachLasso('slide','slideCanvas'); attachLasso('umap','umapCanvas'); attachRoi(
   try{ const r=await fetch('tiles/tiles.json'); TILES = r.ok ? (await r.json()).tiles : null; }
   catch(e){ TILES=null; }
   // backend present (server.py)? -> reveal the ROI export ; otherwise (static hosting) it stays hidden
-  try{ const r=await fetch('tiles/info'); if(r.ok) document.getElementById('roi').style.display=''; }catch(e){}
+  try{ const r=await fetch('tiles/info'); if(r.ok){ document.getElementById('roi').style.display=''; document.getElementById('roiSize').style.display=''; } }catch(e){}
   await loadMethod('cellvit');
 })();
 </script>
