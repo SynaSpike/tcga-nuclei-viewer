@@ -20,6 +20,16 @@
   #count{margin-left:auto;font-size:13px;color:#9fd}
   .hint{position:absolute;bottom:8px;right:10px;z-index:5;font-size:11px;color:#888;background:rgba(0,0,0,.4);padding:3px 7px;border-radius:5px}
   .overlay{position:absolute;inset:0;z-index:4;pointer-events:none;cursor:crosshair}
+  #lassoInfo{position:fixed;top:54px;left:50%;transform:translateX(-50%);z-index:20;display:none;
+    background:rgba(45,108,223,.94);color:#fff;padding:7px 14px;border-radius:8px;font-size:13px;
+    box-shadow:0 2px 12px rgba(0,0,0,.45);pointer-events:none;text-align:center}
+  #lassoInfo b{color:#cfe0ff}
+  #roiInfo{position:fixed;top:54px;left:50%;transform:translateX(-50%);z-index:20;display:none;
+    background:rgba(0,150,40,.94);color:#fff;padding:7px 14px;border-radius:8px;font-size:13px;
+    box-shadow:0 2px 12px rgba(0,0,0,.45);pointer-events:none;text-align:center;max-width:80%}
+  #roiInfo b{color:#d6ffd9}
+  button.roi.on{background:#12a33a;border-color:#12a33a}
+  #bar .sep{width:1px;height:22px;background:#3a3d46;margin:0 3px}
 </style>
 </head>
 <body>
@@ -28,21 +38,27 @@
   <select id="method"><option value="cellvit">CellViT (1280-d)</option><option value="lspdetr">LSP-DETR (384-d)</option></select>
   <label>Color by</label>
   <select id="attr"></select>
-  <button id="lasso">✋ Lasso</button>
+  <button id="lasso" title="Toggle lasso mode (or hold Shift + drag)">✋ Lasso</button>
   <button id="clear">Clear selection</button>
+  <span class="sep"></span>
+  <button id="roi" class="roi" style="display:none" title="Rectangle selection (Shift = square) → export high-res H&E crop with green nuclear contours">▭ ROI</button>
+  <button id="dlSlide" title="Download the current slide view (PNG)">⬇ Slide</button>
+  <button id="dlUmap" title="Download the current UMAP view (PNG)">⬇ UMAP</button>
   <span id="count"></span>
 </div>
+<div id="lassoInfo"><b>Shift + drag</b> to lasso-select · hold <b>Shift</b> and redraw to <b>add</b> more regions · <b>scroll = zoom</b> (always on)</div>
+<div id="roiInfo"></div>
 <div id="views">
   <div class="pane" id="slidePane">
     <div class="title">Slide TCGA-EM-A4FQ</div>
     <div id="legend"></div>
-    <div class="hint">Lasso ON = draw (adds to selection) · OFF = pan/zoom</div>
+    <div class="hint">drag = pan · scroll = zoom · Shift + drag = lasso · ROI mode = rectangle</div>
     <canvas id="slideCanvas"></canvas>
     <div class="overlay" id="slideOverlay"></div>
   </div>
   <div class="pane" id="umapPane">
-    <div class="title">Embedding UMAP</div>
-    <div class="hint">selection linked ↔ slide</div>
+    <div class="title">UMAP of embeddings</div>
+    <div class="hint">selection synced ↔ slide</div>
     <canvas id="umapCanvas"></canvas>
     <div class="overlay" id="umapOverlay"></div>
   </div>
@@ -51,41 +67,53 @@
 <script>
 const {Deck, OrthographicView, ScatterplotLayer, BitmapLayer, PolygonLayer} = deck;
 
-// palette catégorielle (20 couleurs) + override biologique pour PanNuke
+// categorical palette (20 colors) + biological override for PanNuke
 const PALETTE = [[228,26,28],[55,126,184],[77,175,74],[152,78,163],[255,127,0],
   [255,217,47],[166,86,40],[247,129,191],[153,153,153],[26,188,156],
   [31,119,180],[255,152,150],[44,160,44],[214,39,40],[148,103,189],
   [140,86,75],[227,119,194],[127,127,127],[188,189,34],[23,190,207]];
 const TYPE_COLORS = {Neoplastic:[228,26,28],Connective:[55,126,184],Epithelial:[77,175,74],
   Inflammatory:[152,78,163],Dead:[153,153,153]};
+const hexToRgb = h => [parseInt(h.slice(1,3),16),parseInt(h.slice(3,5),16),parseInt(h.slice(5,7),16)];
+// dedicated Leiden palette — supplied n=13 + a distinct 14th color (turquoise)
+// CellViT = 14 clusters ; beyond that (LSP-DETR = 18) -> cyclic fallback
+const LEIDEN_PALETTE = ['#a6cee3','#1f78b4','#b2df8a','#33a02c','#fb9a99','#e31a1c',
+  '#fdbf6f','#ff7f00','#cab2d6','#6a3d9a','#ffff99','#b15928','#45f562','#00ced1'].map(hexToRgb);
 
-let META, N, POS, UMAP, ATTRS={}, curAttr, selected, selCount=0, selVer=0, COLORS;
-let slideData, umapData;       // objets data STABLES (réutilisés à chaque rendu)
-let TILES=null;                // tuiles de la lame (sinon repli sur slide.jpg)
-let slideDeck, umapDeck, lassoOn=false;
-let vsSlide, vsUMAP;          // (non utilisés : unproject via getViewports)
+let META, N, POS, UMAP, ATTRS={}, curAttr, selected, selCount=0, selVer=0, COLORS, UCOLORS;
+let slideData, umapData;       // STABLE data objects (reused on every render)
+let TILES=null;                // slide tiles (else fallback to slide.jpg)
+let slideDeck, umapDeck, lassoOn=false, roiOn=false, shiftDown=false;
+const lassoMode=()=>(lassoOn||shiftDown)&&!roiOn;   // lasso: button or Shift, except in ROI mode
+const roiMode=()=>roiOn;                            // rectangle selection for ROI export
+const isArmed=()=>lassoMode()||roiMode();           // -> disables dragPan (keeps scroll zoom)
+let vsSlide, vsUMAP;          // (unused: unproject via getViewports)
 const W=()=>META.slide.width, H=()=>META.slide.height;
+// OrthographicView zoom that fits a world (worldW x worldH) into a canvas (cw x ch)
+const fitZoom=(cw,ch,worldW,worldH,pad=0.95)=>
+  (cw>0&&ch>0) ? Math.log2(Math.min(cw/worldW, ch/worldH)*pad) : 0;
 
 async function bin(url, Type){ const b=await (await fetch(url)).arrayBuffer(); return new Type(b); }
 
 async function loadMethod(method){
   META = await (await fetch(`data/${method}/meta.json`)).json();
   N = META.n;
-  const pos = await bin(`data/${method}/positions.bin`, Float32Array);  // x,y (px niveau-0)
-  POS = new Float32Array(N*2);                 // y inversé pour un affichage à l'endroit
+  const pos = await bin(`data/${method}/positions.bin`, Float32Array);  // x,y (level-0 px)
+  POS = new Float32Array(N*2);                 // y flipped for an upright display
   for(let i=0;i<N;i++){ POS[i*2]=pos[i*2]; POS[i*2+1]=H()-pos[i*2+1]; }
   UMAP = await bin(`data/${method}/umap.bin`, Float32Array);
   ATTRS={};
   for(const name of Object.keys(META.attributes)) ATTRS[name]=await bin(`data/${method}/${name}.bin`, Int16Array);
-  // buffers + objets data créés UNE fois (références stables -> pas de ré-upload GPU)
-  COLORS=new Uint8Array(N*4);   // couleurs lues par l'accesseur getFillColor
-  slideData={length:N, attributes:{getPosition:{value:POS,size:2}}};   // positions binaires stables
+  // buffers + data objects created ONCE (stable refs -> no GPU re-upload)
+  COLORS=new Uint8Array(N*4);   // SLIDE colors (non-selected dimmed)
+  UCOLORS=new Uint8Array(N*4);  // UMAP colors (full cloud + red selection)
+  slideData={length:N, attributes:{getPosition:{value:POS,size:2}}};   // stable binary positions
   umapData ={length:N, attributes:{getPosition:{value:UMAP,size:2}}};
   selected=new Uint8Array(N); selCount=0; selVer++;
-  // menu attribut
+  // attribute menu
   const sel=document.getElementById('attr'); sel.innerHTML='<option value="__none__">(none)</option>';
   for(const name of Object.keys(META.attributes)){ const o=document.createElement('option'); o.value=name; o.textContent=name; sel.appendChild(o); }
-  curAttr='__none__'; sel.value=curAttr;          // start with NO coloring
+  curAttr='__none__'; sel.value=curAttr;          // start WITHOUT coloring
   buildLegend();
   recolor();
   render(true);
@@ -95,19 +123,31 @@ async function loadMethod(method){
 function catColor(name, code){
   const a=META.attributes[name];
   if(name==='pannuke_type'){ const c=TYPE_COLORS[a.categories[code]]; if(c) return c; }
+  if(name==='leiden') return LEIDEN_PALETTE[code % LEIDEN_PALETTE.length];
   return PALETTE[code % PALETTE.length];
 }
 
-function recolor(){           // remplit COLORS ; getFillColor (accesseur) le relit au bump de selVer
+function recolor(){           // fills COLORS ; getFillColor (accessor) re-reads it on selVer bump
   const none = curAttr==='__none__';
   const codes = none?null:ATTRS[curAttr];
   const anySel=selCount>0;
   for(let i=0;i<N;i++){
+    const sel = selected[i];
+    // base color of the current coloring (no dimming)
+    const bc = none ? [90,90,115] : catColor(curAttr, codes[i]);
+
+    // SLIDE: dim non-selected nuclei to locate the selection on the tissue
     let c, al;
-    if(anySel && !selected[i]){ c=[120,120,120]; al=20; }       // non sélectionné -> estompé
-    else if(none){ c = anySel ? [255,70,70] : [90,90,115]; al=235; }  // sélection en rouge vif sur le tissu
-    else { c=catColor(curAttr, codes[i]); al = anySel?245:205; }
+    if(anySel && !sel){ c=[120,120,120]; al=20; }
+    else if(none){ c = anySel ? [255,70,70] : bc; al=235; }
+    else { c=bc; al = anySel?245:205; }
     COLORS[i*4]=c[0]; COLORS[i*4+1]=c[1]; COLORS[i*4+2]=c[2]; COLORS[i*4+3]=al;
+
+    // UMAP: reproduce the translucent cloud seen during lasso -> very transparent grey in "none" mode
+    // (attribute coloring: higher alpha to stay legible)
+    const uc = none ? [120,120,120] : bc;
+    const ua = none ? 20 : 200;
+    UCOLORS[i*4]=uc[0]; UCOLORS[i*4+1]=uc[1]; UCOLORS[i*4+2]=uc[2]; UCOLORS[i*4+3]=ua;
   }
   selVer++;
 }
@@ -122,24 +162,38 @@ function buildLegend(){
   el.innerHTML=h;
 }
 
-function scatter(id, data, opacity){   // opacity = transparence de la COUCHE (laisse voir le tissu)
+function scatter(id, data, opacity, o={}){   // opacity = LAYER transparency ; o = point size/scale + color buffer
+  const C = o.colors||COLORS;
   return new ScatterplotLayer({
     id, data, opacity,
-    getFillColor:(o,{index})=>[COLORS[index*4],COLORS[index*4+1],COLORS[index*4+2],COLORS[index*4+3]],
-    radiusUnits:'pixels', getRadius:2, radiusMinPixels:1, radiusMaxPixels:8,
+    getFillColor:(d,{index})=>[C[index*4],C[index*4+1],C[index*4+2],C[index*4+3]],
+    radiusUnits:o.units||'pixels', getRadius:o.radius??2,
+    radiusMinPixels:o.minR??1, radiusMaxPixels:o.maxR??8,
     pickable:false, updateTriggers:{getFillColor:selVer}
   });
 }
 
-function slideLayers(){       // points INVISIBLES sur la lame tant qu'il n'y a ni coloration ni sélection
+function slideLayers(){       // slide points are INVISIBLE while there is neither coloring nor selection
   const op = (curAttr==='__none__' && selCount===0) ? 0 : 0.85;
-  // image de la lame : tuiles (haute-rés, pas de limite de texture) ou repli slide.jpg
+  // slide image: tiles (high-res, no texture-size limit) or fallback slide.jpg
   const imgs = TILES
     ? TILES.map(t=>new BitmapLayer({id:'wsi-'+t.file, image:'tiles/'+t.file, bounds:t.bounds}))
     : [ new BitmapLayer({id:'wsi', image:'slide.jpg', bounds:[0,0,W(),H()]}) ];
-  return [ ...imgs, scatter('pts-slide', slideData, op), lassoLayer('slide') ];
+  // slide points: radius in WORLD units -> grow with zoom and hug the cells
+  return [ ...imgs, scatter('pts-slide', slideData, op, {units:'common', radius:5, minR:1.2, maxR:40}), lassoLayer('slide'), roiLayer() ];
 }
-function umapLayers(){ return [ scatter('pts-umap', umapData, 0.9), lassoLayer('umap') ]; }
+// UMAP: small points + very transparent layer -> you see the REAL cloud (density) without lassoing
+// dedicated layer: only the selected nuclei, bright opaque red, on top of the cloud
+function umapSelLayer(){
+  if(selCount===0) return null;
+  return new ScatterplotLayer({id:'umap-sel', data:umapData, opacity:0.95,
+    getFillColor:[255,70,70,255],
+    radiusUnits:'pixels', getRadius:(d,{index})=>selected[index]?1.8:0,
+    radiusMinPixels:0, radiusMaxPixels:3, pickable:false,
+    updateTriggers:{getRadius:selVer}});
+}
+function umapLayers(){ return [ scatter('pts-umap', umapData, 0.32, {radius:1, minR:0.5, maxR:2.5, colors:UCOLORS}),
+  umapSelLayer(), lassoLayer('umap') ].filter(Boolean); }
 
 // ---------- LASSO ----------
 let drawing=null;  // {pane, screenPath:[[x,y]...]}
@@ -149,7 +203,7 @@ function lassoLayer(pane){
     getPolygon:d=>d, stroked:true, filled:true, getFillColor:[45,108,223,40],
     getLineColor:[45,108,223,220], getLineWidth:1.5, lineWidthUnits:'pixels'});
 }
-function viewportFor(pane){   // viewport RÉEL de deck.gl (évite tout désalignement flipY)
+function viewportFor(pane){   // deck.gl REAL viewport (avoids any flipY misalignment)
   const d = pane==='slide'?slideDeck:umapDeck;
   const vps = d.getViewports();
   return vps && vps.length ? vps[0] : null;
@@ -164,45 +218,116 @@ function pointInPoly(x,y,poly){
 }
 function finishLasso(){
   if(!drawing || drawing.world.length<3){ drawing=null; render(); return; }
-  const poly=drawing.world, src=drawing.pane;
+  const poly=drawing.world, src=drawing.pane, additive=drawing.additive;
   const data = src==='slide'?POS:UMAP;
-  // additive multi-selection: keep current selection, add nuclei inside this lasso
+  if(!additive){ selected=new Uint8Array(N); selCount=0; }   // Shift -> ADD ; otherwise replace
+  // bbox to speed things up
   let minx=1e18,miny=1e18,maxx=-1e18,maxy=-1e18;
   for(const p of poly){ minx=Math.min(minx,p[0]);maxx=Math.max(maxx,p[0]);miny=Math.min(miny,p[1]);maxy=Math.max(maxy,p[1]); }
   for(let i=0;i<N;i++){ const x=data[i*2],y=data[i*2+1];
     if(x<minx||x>maxx||y<miny||y>maxy) continue;
-    if(!selected[i] && pointInPoly(x,y,poly)){ selected[i]=1; selCount++; } }
+    if(pointInPoly(x,y,poly) && !selected[i]){ selected[i]=1; selCount++; } }
   drawing=null; recolor(); render(); updateCount();
 }
 function attachLasso(pane, canvasId){
   const c=document.getElementById(canvasId);
-  c.addEventListener('pointerdown', e=>{ if(!lassoOn) return;
-    drawing={pane, screen:[[e.offsetX,e.offsetY]], world:[]}; });
-  c.addEventListener('pointermove', e=>{ if(!lassoOn||!drawing||drawing.pane!==pane) return;
+  c.addEventListener('pointerdown', e=>{ if(!lassoMode()) return;
+    drawing={pane, additive:shiftDown, screen:[[e.offsetX,e.offsetY]], world:[]};
+    try{ c.setPointerCapture(e.pointerId); }catch(_){} });
+  c.addEventListener('pointermove', e=>{ if(!drawing||drawing.pane!==pane) return;
     const vp=viewportFor(pane); if(!vp) return;
     drawing.screen.push([e.offsetX,e.offsetY]);
     drawing.world=drawing.screen.map(p=>{ const w=vp.unproject(p); return [w[0],w[1]]; });
     renderLasso(); });
-  window.addEventListener('pointerup', ()=>{ if(lassoOn&&drawing) finishLasso(); });
+  window.addEventListener('pointerup', ()=>{ if(drawing) finishLasso(); });
+}
+
+// ---------- ROI (rectangle -> export H&E crop + green contours) — needs the local backend ----------
+let roiDrawing=null, roiRect=null;
+const ROI_HINT='Drag on the slide = <b>rectangle</b> · <b>Shift = square</b> · release → export H&E crop with green contours';
+function roiLayer(){
+  if(!roiRect) return null;
+  return new PolygonLayer({id:'roi-rect', data:[roiRect], getPolygon:d=>d,
+    stroked:true, filled:true, getFillColor:[0,255,60,30], getLineColor:[0,255,60,235],
+    getLineWidth:2, lineWidthUnits:'pixels'});
+}
+function clearRoiRect(){ roiRect=null; if(slideDeck) slideDeck.setProps({layers:slideLayers()}); }
+function attachRoi(){
+  const c=document.getElementById('slideCanvas');
+  c.addEventListener('pointerdown', e=>{ if(!roiMode()) return;
+    const vp=viewportFor('slide'); if(!vp) return;
+    const w=vp.unproject([e.offsetX,e.offsetY]); roiDrawing={start:[w[0],w[1]]};
+    try{ c.setPointerCapture(e.pointerId); }catch(_){} });
+  c.addEventListener('pointermove', e=>{ if(!roiDrawing) return;
+    const vp=viewportFor('slide'); if(!vp) return;
+    const w=vp.unproject([e.offsetX,e.offsetY]);
+    let [sx,sy]=roiDrawing.start, ex=w[0], ey=w[1];
+    if(shiftDown){ const dx=ex-sx, dy=ey-sy, s=Math.max(Math.abs(dx),Math.abs(dy));  // Shift -> square
+      ex=sx+(dx<0?-s:s); ey=sy+(dy<0?-s:s); }
+    roiRect=[[sx,sy],[ex,sy],[ex,ey],[sx,ey]];
+    if(slideDeck) slideDeck.setProps({layers:slideLayers()}); });
+  window.addEventListener('pointerup', ()=>{ if(roiDrawing){ roiDrawing=null; finishRoi(); } });
+}
+function finishRoi(){
+  if(!roiRect) return;
+  const xs=roiRect.map(p=>p[0]), ys=roiRect.map(p=>p[1]);
+  const minx=Math.min(...xs), maxx=Math.max(...xs), miny=Math.min(...ys), maxy=Math.max(...ys);
+  const x=Math.round(minx), w=Math.round(maxx-minx);
+  const y=Math.round(H()-maxy), h=Math.round(maxy-miny);   // world (y up) -> level-0 openslide (y down)
+  if(w<8||h<8){ clearRoiRect(); return; }
+  exportRoi(x,y,w,h);
+  clearRoiRect();      // the rectangle disappears once the ROI is captured
+}
+async function exportRoi(x,y,w,h){
+  const el=document.getElementById('roiInfo'); el.style.display='block';
+  el.innerHTML=`Exporting ROI ${w}×${h} px… (high-res read + contour drawing)`;
+  try{
+    const r=await fetch(`roi?x=${x}&y=${y}&w=${w}&h=${h}`);
+    if(!r.ok){ el.innerHTML='⚠ ROI export unavailable — start the <b>backend</b>: <b>python tool/server.py --slide tool/slide/TCGA-EM-A4FQ.svs</b>'; return; }
+    const cells=r.headers.get('X-Roi-Cells')||'?';
+    const blob=await r.blob(); const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob); a.download=`roi_x${x}_y${y}_w${w}_h${h}.png`; a.click();
+    el.innerHTML=`✓ ROI ${w}×${h} px · ${cells} nuclei · downloaded + saved to <b>tool/roi_exports/</b>`;
+    setTimeout(()=>{ if(roiMode()) el.innerHTML=ROI_HINT; }, 4500);
+  }catch(err){ el.innerHTML='⚠ Backend required for ROI export (server.py, not the static server).'; }
+}
+
+// ---------- PNG capture of the views (publication-ready) ----------
+function downloadCanvas(deckObj, filename){
+  if(!deckObj) return;
+  deckObj.redraw(true);
+  requestAnimationFrame(()=>{
+    const cv=deckObj.getCanvas();
+    cv.toBlob(b=>{ if(!b){ alert('Empty capture (reload the page).'); return; }
+      const a=document.createElement('a'); a.href=URL.createObjectURL(b); a.download=filename; a.click();
+    }, 'image/png');
+  });
 }
 
 function render(initial){
-  const common={controller:!lassoOn, views:new OrthographicView({flipY:false})};
+  // armed: only pan-on-drag (dragPan) is disabled, SCROLL/zoom stays active
+  const ctrl = isArmed() ? {dragPan:false} : true;
+  // preserveDrawingBuffer -> enables PNG capture of the canvases (⬇ Slide / ⬇ UMAP buttons)
+  const common={controller:ctrl, views:new OrthographicView({flipY:false}), glOptions:{preserveDrawingBuffer:true}};
   if(initial || !slideDeck){
-    // vue NON contrôlée (deck.gl gère le viewState en interne -> pas de retard des points)
+    // UNCONTROLLED view (deck.gl keeps the viewState internally -> no point lag)
+    const sp=document.getElementById('slidePane'), up=document.getElementById('umapPane');
+    const sz=fitZoom(sp.clientWidth, sp.clientHeight, W(), H(), 0.96);   // whole slide, fitted to the pane
     slideDeck=new Deck({canvas:'slideCanvas', ...common,
-      initialViewState:{target:[W()/2,H()/2,0], zoom:-6},
+      initialViewState:{target:[W()/2,H()/2,0], zoom:sz, minZoom:sz-1, maxZoom:3},
       layers:slideLayers()});
+    const uw=META.umap.xmax-META.umap.xmin, uh=META.umap.ymax-META.umap.ymin;
     const ur=(META.umap.xmin+META.umap.xmax)/2, vr=(META.umap.ymin+META.umap.ymax)/2;
+    const uz=fitZoom(up.clientWidth, up.clientHeight, uw, uh, 0.9);      // whole UMAP cloud, fitted to the pane
     umapDeck=new Deck({canvas:'umapCanvas', ...common,
-      initialViewState:{target:[ur,vr,0], zoom:5},
+      initialViewState:{target:[ur,vr,0], zoom:uz, minZoom:uz-1, maxZoom:uz+7},
       layers:umapLayers()});
   } else {
-    slideDeck.setProps({controller:!lassoOn, layers:slideLayers()});
-    umapDeck.setProps({controller:!lassoOn, layers:umapLayers()});
+    slideDeck.setProps({controller:ctrl, layers:slideLayers()});
+    umapDeck.setProps({controller:ctrl, layers:umapLayers()});
   }
 }
-function renderLasso(){       // maj légère pendant le tracé (couleurs en cache, juste le polygone)
+function renderLasso(){       // light update while drawing (colors cached, just the polygon)
   if(slideDeck) slideDeck.setProps({layers:slideLayers()});
   if(umapDeck) umapDeck.setProps({layers:umapLayers()});
 }
@@ -212,19 +337,33 @@ function updateCount(){ document.getElementById('count').textContent =
 // ---------- UI ----------
 document.getElementById('method').onchange=e=>loadMethod(e.target.value);
 document.getElementById('attr').onchange=e=>{ curAttr=e.target.value; buildLegend(); recolor(); render(); };
-function setLasso(on){ lassoOn=on;
-  document.getElementById('lasso').classList.toggle('on',on);
-  const pe = on?'auto':'none';
-  document.getElementById('slideOverlay').style.pointerEvents=pe;
-  document.getElementById('umapOverlay').style.pointerEvents=pe;
-  render(); }
+function setModeUI(){               // reflects the current mode: buttons, cursors, info bubbles, controller
+  const lasso=lassoMode(), roi=roiMode();
+  document.getElementById('lasso').classList.toggle('on', lassoOn && !roiOn);
+  document.getElementById('roi').classList.toggle('on', roiOn);
+  document.getElementById('lassoInfo').style.display = lasso?'block':'none';
+  document.getElementById('roiInfo').style.display   = roi?'block':'none';
+  document.getElementById('slideCanvas').style.cursor = (lasso||roi)?'crosshair':'';
+  document.getElementById('umapCanvas').style.cursor  = lasso?'crosshair':'';
+  render();
+}
+function setLasso(on){ lassoOn=on; if(on) roiOn=false; setModeUI(); }
+function setRoi(on){ roiOn=on; if(on){ lassoOn=false; document.getElementById('roiInfo').innerHTML=ROI_HINT; } else clearRoiRect(); setModeUI(); }
 document.getElementById('lasso').onclick=()=>setLasso(!lassoOn);
+document.getElementById('roi').onclick=()=>setRoi(!roiOn);
 document.getElementById('clear').onclick=()=>{ selected=new Uint8Array(N); selCount=0; recolor(); render(); updateCount(); };
+document.getElementById('dlSlide').onclick=()=>downloadCanvas(slideDeck, `slide_${curAttr}.png`);
+document.getElementById('dlUmap').onclick =()=>downloadCanvas(umapDeck, `umap_${curAttr}.png`);
+// Shift = arms the lasso (additive) outside ROI mode ; in ROI mode Shift constrains to a square ; release finishes an ongoing lasso
+window.addEventListener('keydown', e=>{ if(e.key==='Shift'&&!shiftDown){ shiftDown=true; setModeUI(); } });
+window.addEventListener('keyup',   e=>{ if(e.key==='Shift'&&shiftDown){ shiftDown=false; if(drawing) finishLasso(); setModeUI(); } });
 
-attachLasso('slide','slideOverlay'); attachLasso('umap','umapOverlay');
+attachLasso('slide','slideCanvas'); attachLasso('umap','umapCanvas'); attachRoi();
 (async ()=>{
   try{ const r=await fetch('tiles/tiles.json'); TILES = r.ok ? (await r.json()).tiles : null; }
   catch(e){ TILES=null; }
+  // backend present (server.py)? -> reveal the ROI export ; otherwise (static hosting) it stays hidden
+  try{ const r=await fetch('tiles/info'); if(r.ok) document.getElementById('roi').style.display=''; }catch(e){}
   await loadMethod('cellvit');
 })();
 </script>
