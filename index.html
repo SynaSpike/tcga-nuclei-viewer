@@ -139,7 +139,7 @@ function recolor(){           // fills COLORS ; getFillColor (accessor) re-reads
     // SLIDE: dim non-selected nuclei to locate the selection on the tissue
     let c, al;
     if(anySel && !sel){ c=[120,120,120]; al=20; }
-    else if(none){ c = anySel ? [255,70,70] : bc; al=235; }
+    else if(none){ c = anySel ? [0,230,60] : bc; al=235; }   // selection in bright GREEN on the tissue
     else { c=bc; al = anySel?245:205; }
     COLORS[i*4]=c[0]; COLORS[i*4+1]=c[1]; COLORS[i*4+2]=c[2]; COLORS[i*4+3]=al;
 
@@ -187,7 +187,7 @@ function slideLayers(){       // slide points are INVISIBLE while there is neith
 function umapSelLayer(){
   if(selCount===0) return null;
   return new ScatterplotLayer({id:'umap-sel', data:umapData, opacity:0.95,
-    getFillColor:[255,70,70,255],
+    getFillColor:[0,230,60,255],
     radiusUnits:'pixels', getRadius:(d,{index})=>selected[index]?1.8:0,
     radiusMinPixels:0, radiusMaxPixels:3, pickable:false,
     updateTriggers:{getRadius:selVer}});
